@@ -9,13 +9,14 @@ package metrics
 import (
 	"context"
 
+	"github.com/rs/zerolog/log"
+
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/metric/global"
 )
 
 var (
-	grpcRequest     metric.Float64ValueRecorder
 	providerAttr    = attribute.String("provider", "oci-provider")
 	serviceNameAttr = attribute.String("service.name", "oci-secrets-store-csi-driver-provider")
 	grpcMethodKey   = "grpc_method"
@@ -24,7 +25,7 @@ var (
 )
 
 type reporter struct {
-	meter metric.Meter
+	grpcRequest metric.Float64Histogram
 }
 
 // StatsReporter is the interface for reporting metrics
@@ -34,16 +35,22 @@ type StatsReporter interface {
 
 // NewStatsReporter creates a new StatsReporter
 func NewStatsReporter() StatsReporter { //nolint:ireturn //known
-	meter := global.Meter("oci-secrets-store-csi-driver-provider")
+	meter := otel.Meter("oci-secrets-store-csi-driver-provider")
 
-	grpcRequest = metric.Must(meter).NewFloat64ValueRecorder("grpc_request",
+	grpcRequest, err := meter.Float64Histogram("grpc_request",
 		metric.WithDescription("Distribution of how long it took for the gRPC requests"))
-	return &reporter{meter: meter}
+	if err != nil {
+		log.Error().Err(err).Msg("failed to create grpc request metric")
+	}
+	return &reporter{grpcRequest: grpcRequest}
 }
 
 // ReportGRPCRequest reports the duration of the gRPC request
 // method and code are used to identify the gRPC request
 func (r *reporter) ReportGRPCRequest(ctx context.Context, duration float64, method, code, message string) {
+	if r.grpcRequest == nil {
+		return
+	}
 	attributes := []attribute.KeyValue{
 		serviceNameAttr,
 		providerAttr,
@@ -51,8 +58,5 @@ func (r *reporter) ReportGRPCRequest(ctx context.Context, duration float64, meth
 		attribute.String(grpcCodeKey, code),
 		attribute.String(grpcMessageKey, message),
 	}
-	r.meter.RecordBatch(ctx,
-		attributes,
-		grpcRequest.Measurement(duration),
-	)
+	r.grpcRequest.Record(ctx, duration, metric.WithAttributes(attributes...))
 }

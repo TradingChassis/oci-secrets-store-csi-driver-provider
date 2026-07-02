@@ -5,7 +5,7 @@ import (
 	"unicode/utf8"
 )
 
-const hex = "0123456789abcdef"
+const hexCharacters = "0123456789abcdef"
 
 var noEscapeTable = [256]bool{}
 
@@ -37,7 +37,7 @@ func (e Encoder) AppendStrings(dst []byte, vals []string) []byte {
 //
 // The operation loops though each byte in the string looking
 // for characters that need json or utf8 encoding. If the string
-// does not need encoding, then the string is appended in it's
+// does not need encoding, then the string is appended in its
 // entirety to the byte slice.
 // If we encounter a byte that does need encoding, switch up
 // the operation and perform a byte-by-byte read-encode-append.
@@ -56,7 +56,7 @@ func (Encoder) AppendString(dst []byte, s string) []byte {
 			return append(dst, '"')
 		}
 	}
-	// The string has no need for encoding an therefore is directly
+	// The string has no need for encoding and therefore is directly
 	// appended to the byte slice.
 	dst = append(dst, s...)
 	// End with a double quote
@@ -66,7 +66,7 @@ func (Encoder) AppendString(dst []byte, s string) []byte {
 // AppendStringers encodes the provided Stringer list to json and
 // appends the encoded Stringer list to the input byte slice.
 func (e Encoder) AppendStringers(dst []byte, vals []fmt.Stringer) []byte {
-	if len(vals) == 0 {
+	if vals == nil || len(vals) == 0 {
 		return append(dst, '[', ']')
 	}
 	dst = append(dst, '[')
@@ -88,7 +88,7 @@ func (e Encoder) AppendStringer(dst []byte, val fmt.Stringer) []byte {
 	return e.AppendString(dst, val.String())
 }
 
-//// appendStringComplex is used by appendString to take over an in
+// appendStringComplex is used by appendString to take over an in
 // progress JSON string encoding that encountered a character that needs
 // to be encoded.
 func appendStringComplex(dst []byte, s string, i int) []byte {
@@ -99,7 +99,7 @@ func appendStringComplex(dst []byte, s string, i int) []byte {
 			r, size := utf8.DecodeRuneInString(s[i:])
 			if r == utf8.RuneError && size == 1 {
 				// In case of error, first append previous simple characters to
-				// the byte slice if any and append a remplacement character code
+				// the byte slice if any and append a replacement character code
 				// in place of the invalid sequence.
 				if start < i {
 					dst = append(dst, s[start:i]...)
@@ -137,7 +137,7 @@ func appendStringComplex(dst []byte, s string, i int) []byte {
 		case '\t':
 			dst = append(dst, '\\', 't')
 		default:
-			dst = append(dst, '\\', 'u', '0', '0', hex[b>>4], hex[b&0xF])
+			dst = append(dst, '\\', 'u', '0', '0', hexCharacters[b>>4], hexCharacters[b&0xF])
 		}
 		i++
 		start = i
