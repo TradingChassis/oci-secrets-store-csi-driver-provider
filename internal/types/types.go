@@ -56,6 +56,7 @@ type PodInfo struct {
 	Name               string
 	UID                apiMachineryTypes.UID
 	ServiceAccountName string
+	ServiceAccountUID  apiMachineryTypes.UID
 }
 
 type VersionNumber int64
@@ -208,8 +209,7 @@ type Auth struct {
 }
 
 type WorkloadIdentityConfig struct {
-	// Region  string
-	SaToken []byte
+	PodInfo PodInfo
 }
 
 type AuthConfig struct {

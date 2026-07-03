@@ -11,17 +11,21 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
 
-	"go.opentelemetry.io/otel/exporters/metric/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 func initPrometheusExporter(port int, path string) error {
-	pusher, err := prometheus.InstallNewPipeline(prometheus.Config{})
+	exporter, err := prometheus.New()
 	if err != nil {
 		return err
 	}
-	http.HandleFunc(path, pusher.ServeHTTP)
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter)))
+	http.Handle(path, promhttp.Handler())
 	go func() {
 		server := &http.Server{
 			Addr:              fmt.Sprintf(":%v", port),

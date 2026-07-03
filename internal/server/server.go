@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"os"
@@ -27,22 +28,31 @@ import (
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apiMachineryTypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	provider "sigs.k8s.io/secrets-store-csi-driver/provider/v1alpha1"
 )
 
+type kubernetesCoreClient interface {
+	CoreV1() corev1client.CoreV1Interface
+}
+
 // ProviderServer implements predefined provider API
 type ProviderServer struct {
 	secretService service.SecretService
+	k8sClientSet  kubernetesCoreClient
+	k8sClientMu   sync.Mutex
 }
 
 func NewOCIVaultProviderServer() (*ProviderServer, error) {
-	ociService, err := service.NewOCISecretService()
+	server := &ProviderServer{}
+	ociService, err := service.NewOCISecretServiceWithTokenSource(server)
 	if err != nil {
 		return nil, err
 	}
 	log.Info().Msg("Created OCI Vault service")
-	return &ProviderServer{ociService}, nil
+	server.secretService = ociService
+	return server, nil
 }
 
 // attributes' fields
@@ -172,23 +182,27 @@ func (server *ProviderServer) retrieveAuthConfig(ctx context.Context,
 		}
 		auth.Config = *authCfg
 	} else if principalType == types.Workload {
+		serviceAccountName := requestAttributes[podServiceAccountField]
+		podNamespace := requestAttributes[podNamespaceField]
+		serviceAccount, err := server.readK8sServiceAccount(ctx, podNamespace, serviceAccountName)
+		if err != nil {
+			log.Err(err).
+				Str("serviceAccount", serviceAccountName).
+				Str("namespace", podNamespace).
+				Msg("Error while reading service account from k8s api")
+			return nil, fmt.Errorf("error retrieving service account: %v", serviceAccountName)
+		}
 
-		podInfo := &types.PodInfo{
+		podInfo := types.PodInfo{
 			Name:               requestAttributes[podNameField],
 			UID:                apiMachineryTypes.UID(requestAttributes[podUIDField]),
-			ServiceAccountName: requestAttributes[podServiceAccountField],
-			Namespace:          requestAttributes[podNamespaceField],
-		}
-		saTokenStr, err := server.getSAToken(podInfo)
-		if err != nil {
-			err := fmt.Errorf("can not generate token for service account: %s, namespace: %s, Error: %v",
-				podInfo.ServiceAccountName, podInfo.Namespace, err)
-			return nil, err
+			ServiceAccountName: serviceAccountName,
+			ServiceAccountUID:  serviceAccount.UID,
+			Namespace:          podNamespace,
 		}
 
 		auth.WorkloadIdentityCfg = types.WorkloadIdentityConfig{
-			SaToken: []byte(saTokenStr),
-			// Region: region,
+			PodInfo: podInfo,
 		}
 	}
 	return auth, nil
@@ -219,7 +233,14 @@ func parseAuthConfig(secret *core.Secret, authConfigSecretName string) (*types.A
 	return authCfg, nil
 }
 
-func (server *ProviderServer) getK8sClientSet() (*kubernetes.Clientset, error) {
+func (server *ProviderServer) getK8sClientSet() (kubernetesCoreClient, error) {
+	server.k8sClientMu.Lock()
+	defer server.k8sClientMu.Unlock()
+
+	if server.k8sClientSet != nil {
+		return server.k8sClientSet, nil
+	}
+
 	clusterCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("can not get cluster config. error: %v", err)
@@ -230,52 +251,67 @@ func (server *ProviderServer) getK8sClientSet() (*kubernetes.Clientset, error) {
 		return nil, fmt.Errorf("can not initialize kubernetes client. error: %v", err)
 	}
 
-	return clientset, nil
+	server.k8sClientSet = clientset
+	return server.k8sClientSet, nil
 }
 
-func (server *ProviderServer) getSAToken(podInfo *types.PodInfo) (string, error) {
+func (server *ProviderServer) TokenForServiceAccount(
+	ctx context.Context,
+	namespace string,
+	serviceAccountName string,
+	ttl time.Duration) (*service.ServiceAccountToken, error) {
+
 	clientSet, err := server.getK8sClientSet()
 	if err != nil {
-		return "", fmt.Errorf("unable to get k8s client: %v", err)
+		return nil, fmt.Errorf("unable to get k8s client: %v", err)
 	}
-	ttl := int64((15 * time.Minute).Seconds())
+	expirationSeconds := int64(ttl.Seconds())
 	resp, err := clientSet.CoreV1().
-		ServiceAccounts(podInfo.Namespace).
-		CreateToken(context.Background(), podInfo.ServiceAccountName,
+		ServiceAccounts(namespace).
+		CreateToken(ctx, serviceAccountName,
 			&authenticationv1.TokenRequest{
 				Spec: authenticationv1.TokenRequestSpec{
-					ExpirationSeconds: &ttl,
-					Audiences:         []string{},
-					BoundObjectRef: &authenticationv1.BoundObjectReference{
-						Kind:       "Pod",
-						APIVersion: "v1",
-						Name:       podInfo.Name,
-						UID:        podInfo.UID,
-					},
+					ExpirationSeconds: &expirationSeconds,
 				},
 			},
 			meta.CreateOptions{},
 		)
 	if err != nil {
-		return "", fmt.Errorf("unable to fetch token from token api: %v", err)
+		return nil, fmt.Errorf("unable to fetch token from token api: %v", err)
 	}
-	return resp.Status.Token, nil
+
+	expiresAt := time.Now().Add(ttl)
+	if !resp.Status.ExpirationTimestamp.IsZero() {
+		expiresAt = resp.Status.ExpirationTimestamp.Time
+	}
+
+	return &service.ServiceAccountToken{
+		Token:     resp.Status.Token,
+		ExpiresAt: expiresAt,
+	}, nil
 }
 
 func (server *ProviderServer) readK8sSecret(ctx context.Context, namespace string,
 	secretName string) (*core.Secret, error) {
-	clusterCfg, err := rest.InClusterConfig()
+	clientset, err := server.getK8sClientSet()
 	if err != nil {
-		return &core.Secret{}, fmt.Errorf("can not get cluster config. error: %v", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(clusterCfg)
-	if err != nil {
-		return &core.Secret{}, fmt.Errorf("can not initialize kubernetes client. error: %v", err)
+		return &core.Secret{}, fmt.Errorf("unable to get k8s client: %v", err)
 	}
 
 	k8client := clientset.CoreV1()
 	return k8client.Secrets(namespace).Get(ctx, secretName, meta.GetOptions{})
+}
+
+func (server *ProviderServer) readK8sServiceAccount(
+	ctx context.Context, namespace string, serviceAccountName string) (*core.ServiceAccount, error) {
+
+	clientset, err := server.getK8sClientSet()
+	if err != nil {
+		return &core.ServiceAccount{}, fmt.Errorf("unable to get k8s client: %v", err)
+	}
+
+	k8client := clientset.CoreV1()
+	return k8client.ServiceAccounts(namespace).Get(ctx, serviceAccountName, meta.GetOptions{})
 }
 
 func (server *ProviderServer) unmarshalRequestAttributes(attributesString string) (map[string]string, error) {
