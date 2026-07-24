@@ -5,6 +5,14 @@ Provider for OCI Vault allows you to get secrets stored in OCI Vault and mount t
 
 The provider is a gRPC server accessible via the Unix domain socket. It's interface is defined by the Secrets Store CSI driver. Secrets Store CSI Driver requests the provider's API in order to mount secrets onto the pods.
 
+## TradingChassis fork
+
+This fork publishes multi-arch images to
+`ghcr.io/tradingchassis/oci-secrets-store-csi-driver-provider`.
+
+See [docs/TRADINGCHASSIS.md](./docs/TRADINGCHASSIS.md) for image tags, Helm
+overrides, CI/publish behaviour, and upstream sync notes.
+
 ## Getting Started
 
 Please have a look at [Getting Started](./GettingStarted.md)

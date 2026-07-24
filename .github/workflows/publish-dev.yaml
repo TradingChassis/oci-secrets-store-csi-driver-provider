@@ -1,0 +1,172 @@
+name: Publish development image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (branch, tag, or commit SHA)
+        required: true
+        type: string
+        default: main
+      tag_style:
+        description: Development tag style
+        required: true
+        type: choice
+        options:
+          - dev
+          - dev-branch
+          - sha-only
+        default: dev-branch
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: tradingchassis/oci-secrets-store-csi-driver-provider
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  publish-dev:
+    name: Multi-arch development publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute development tags
+        id: meta
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          SHA="$(git rev-parse HEAD)"
+          CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          STYLE="${{ inputs.tag_style }}"
+          REF_NAME="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+          if [ "$REF_NAME" = "HEAD" ] || [ -z "$REF_NAME" ]; then
+            REF_NAME="${{ inputs.ref }}"
+          fi
+
+          sanitize() {
+            echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' | cut -c1-120
+          }
+
+          BRANCH_TAG="dev-$(sanitize "$REF_NAME")"
+
+          # Refuse to overwrite an existing immutable SHA tag with a different digest.
+          # If the SHA tag already points at an image, skip republishing that tag and only
+          # refresh mutable development tags.
+          SHA_EXISTS=false
+          if docker buildx imagetools inspect "${IMAGE}:${SHA}" >/dev/null 2>&1; then
+            SHA_EXISTS=true
+            echo "SHA tag already exists: ${IMAGE}:${SHA} (will not overwrite)"
+          fi
+
+          TAGS=()
+          case "$STYLE" in
+            dev)
+              TAGS+=("${IMAGE}:dev")
+              ;;
+            dev-branch)
+              TAGS+=("${IMAGE}:dev")
+              TAGS+=("${IMAGE}:${BRANCH_TAG}")
+              ;;
+            sha-only)
+              ;;
+            *)
+              echo "Unsupported tag_style: $STYLE"
+              exit 1
+              ;;
+          esac
+
+          if [ "$SHA_EXISTS" != "true" ]; then
+            TAGS+=("${IMAGE}:${SHA}")
+          elif [ "$STYLE" = "sha-only" ]; then
+            echo "sha-only requested but immutable SHA tag already exists; nothing to do."
+            exit 1
+          fi
+
+          if [ ${#TAGS[@]} -eq 0 ]; then
+            echo "No tags to publish"
+            exit 1
+          fi
+
+          # Guardrails: never publish production or semver tags from this workflow.
+          for T in "${TAGS[@]}"; do
+            TAG="${T##*:}"
+            if [ "$TAG" = "latest" ] || [ "$TAG" = "main" ]; then
+              echo "Refusing forbidden tag: $TAG"
+              exit 1
+            fi
+            # Skip SHA tags: a rare all-digit commit hash must not be treated as semver.
+            if [ "$TAG" = "$SHA" ]; then
+              continue
+            fi
+            if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+$ ]] || [[ "$TAG" =~ ^v?[0-9]+$ ]]; then
+              echo "Refusing semantic/version-like tag from development publish: $TAG"
+              exit 1
+            fi
+          done
+
+          {
+            echo "image=${IMAGE}"
+            echo "sha=${SHA}"
+            echo "created=${CREATED}"
+            echo "branch_tag=${BRANCH_TAG}"
+            echo "tags<<EOF"
+            printf '%s\n' "${TAGS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Publishing tags:"
+          printf '%s\n' "${TAGS[@]}"
+
+      - name: Build and push multi-arch development image
+        run: |
+          TAG_ARGS=()
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            TAG_ARGS+=(--tag "$line")
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+          docker buildx build \
+            --platform=${{ env.PLATFORMS }} \
+            --file build/Dockerfile \
+            --build-arg VERSION=dev \
+            --build-arg REVISION=${{ steps.meta.outputs.sha }} \
+            --build-arg CREATED=${{ steps.meta.outputs.created }} \
+            --provenance=false \
+            "${TAG_ARGS[@]}" \
+            --push \
+            .
+
+      - name: Validate multi-arch manifest
+        run: |
+          # Prefer an immutable SHA tag when present; otherwise inspect the first published tag.
+          if docker buildx imagetools inspect ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }} >/dev/null 2>&1; then
+            docker buildx imagetools inspect ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}
+          else
+            FIRST_TAG="$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)"
+            docker buildx imagetools inspect "$FIRST_TAG"
+          fi

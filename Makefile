@@ -20,9 +20,16 @@ IMAGE_URL=$(IMAGE_REGISTRY)/$(IMAGE_REPO_NAME)
 IMAGE_TAG=$(GIT_TAG)
 IMAGE_PATH=$(IMAGE_URL):$(IMAGE_TAG)
 
+# TradingChassis multi-arch defaults (override in CI as needed)
+PLATFORMS ?= linux/amd64,linux/arm64
+BUILDX_OUTPUT ?= type=image,name=$(IMAGE_PATH),push=false
+OCI_VERSION ?= $(IMAGE_TAG)
+OCI_REVISION ?= $(GIT_TAG)
+OCI_CREATED ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
 LDFLAGS?="-X github.com/oracle-samples/oci-secrets-store-csi-driver-provider/internal/server.BuildVersion=$(BUILD_VERSION)"
 
-.PHONY : lint test build
+.PHONY : lint test build docker-build docker-push docker-build-push docker-buildx print-docker-image-path
 
 all: lint test build
 
@@ -47,13 +54,27 @@ build: cmd/server/main.go
 
 docker-build:
 	docker build -t ${IMAGE_PATH} -f build/Dockerfile .
-	# docker buildx build --platform=linux/amd64 -t ${IMAGE_PATH} -f build/Dockerfile .   
 
 docker-push:
 	docker push ${IMAGE_PATH}
 
 docker-build-push: docker-build
 	docker push ${IMAGE_PATH}
+
+# Multi-arch Buildx build. Examples:
+#   make docker-buildx IMAGE_REGISTRY=ghcr.io/tradingchassis
+#   make docker-buildx BUILDX_OUTPUT=type=oci,dest=/tmp/image.oci
+#   make docker-buildx BUILDX_OUTPUT=type=registry,name=$(IMAGE_PATH),push=true
+docker-buildx:
+	docker buildx build \
+		--platform=$(PLATFORMS) \
+		--file build/Dockerfile \
+		--build-arg VERSION=$(OCI_VERSION) \
+		--build-arg REVISION=$(OCI_REVISION) \
+		--build-arg CREATED=$(OCI_CREATED) \
+		--provenance=false \
+		--output=$(BUILDX_OUTPUT) \
+		.
 
 print-docker-image-path:
 	@echo ${IMAGE_PATH}
