@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches-ignore:
+      - main
+      - gh-pages
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26.0"
+  IMAGE_REGISTRY: ghcr.io/tradingchassis
+  IMAGE_NAME: oci-secrets-store-csi-driver-provider
+
+jobs:
+  unit-tests:
+    name: Unit tests and Go build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Build binary
+        run: go build -mod vendor -o dist/provider ./cmd/server/main.go
+
+      - name: Run unit tests
+        run: go test -covermode=count -coverprofile=profile.cov ./...
+
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          args: --timeout=10m
+
+  helm:
+    name: Helm lint and template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Helm dependency update
+        run: helm dependency update charts/oci-secrets-store-csi-driver-provider
+
+      - name: Helm lint
+        run: helm lint charts/oci-secrets-store-csi-driver-provider
+
+      - name: Helm template
+        run: |
+          helm template oci-provider charts/oci-secrets-store-csi-driver-provider \
+            --set provider.image.repository=${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set provider.image.tag=ci-validate \
+            > /tmp/rendered.yaml
+          test -s /tmp/rendered.yaml
+
+  docker-amd64:
+    name: Docker build linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build linux/amd64 (no push)
+        run: |
+          docker buildx build \
+            --platform=linux/amd64 \
+            --file build/Dockerfile \
+            --build-arg VERSION=ci \
+            --build-arg REVISION=${{ github.sha }} \
+            --build-arg CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --provenance=false \
+            --output=type=oci,dest=/tmp/image-amd64.oci \
+            .
+          test -s /tmp/image-amd64.oci
+
+  docker-arm64:
+    name: Docker build linux/arm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build linux/arm64 (no push)
+        run: |
+          docker buildx build \
+            --platform=linux/arm64 \
+            --file build/Dockerfile \
+            --build-arg VERSION=ci \
+            --build-arg REVISION=${{ github.sha }} \
+            --build-arg CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --provenance=false \
+            --output=type=oci,dest=/tmp/image-arm64.oci \
+            .
+          test -s /tmp/image-arm64.oci
